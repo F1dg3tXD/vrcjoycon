@@ -1,657 +1,573 @@
 #!/usr/bin/env python3
+"""VRCJoyCon - cross-platform OSC haptics controller.
 
-from configparser import ConfigParser
-import coloredlogs, logging, os, sys, ctypes
+Maps VRChat/ChilloutVR OSC parameters to rumble motors on Nintendo Switch
+Joy-Cons and standard gamepads. Provides a Tkinter UI for assigning
+parameters, controllers and motors, plus a standard OSC UDP server.
+"""
+
+import argparse
+import asyncio
+import json
+import logging
+import os
+import sys
+import threading
+import time
 from pathlib import Path
 
+# Ensure local imports work when run as script
+HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("VRCJOYCON")
-configpath = Path("config.ini")
-if not configpath.exists():
-	configpath = Path("src/config.ini")
-	if not configpath.exists():
-		configpath = Path("../config.ini")
-		if not configpath.exists():
-			log.critical("Could not find config.ini")
 
+import tkinter as tk
+from tkinter import ttk, messagebox, scrolledtext
 
-def setup_config():
-	global config, debug, verbose
+# Optional heavy deps
+try:
+    import hid
+except Exception as e:
+    hid = None
+    log.warning("hid unavailable: %s", e)
 
-	config = ConfigParser(default_section="DONOTUSE")
-	config.read(configpath)
+try:
+    from pyjoycon import get_device_ids
+    from pyjoycon import JoyCon as _JoyConBase
+except Exception as e:
+    get_device_ids = None
+    _JoyConBase = None
+    log.warning("pyjoycon unavailable: %s", e)
 
-	debug = config.getboolean("main", "debug")
-	verbose = config.getboolean("main", "verbose")
-	coloredlogs.install(level=logging.DEBUG if debug else logging.INFO)
-	if debug:
-		log.debug("DEBUG ON")
+try:
+    import pygame
+except Exception as e:
+    pygame = None
+    log.warning("pygame unavailable: %s", e)
 
-
-setup_config()
-
-if sys.platform == "win32":
-	os.system("title ChilloutVR/VRChat Joy-Con OSC Connector")
-	try:
-		ctypes.cdll.LoadLibrary(r"hidapi.dll")
-	except (FileNotFoundError,ImportError):
-		try:
-			ctypes.cdll.LoadLibrary(r"./hidapi.dll")
-		except (FileNotFoundError,ImportError):
-			pass
-else:
-	print("\33]0;ChilloutVR/VRChat Joy-Con OSC Connector\a")
-
-
-from pyjoycon import JoyCon, get_device_ids, joycon
 from pythonosc import dispatcher, osc_server
 from pythonosc.udp_client import SimpleUDPClient
 
-from functools import reduce
-import operator
-
-# from pprint import pprint
-import asyncio, argparse, sys, typing, functools
-
-# from contextlib import suppress
-# from asynccmd import Cmd
-from aioconsole import AsynchronousCli
+CONFIG_PATH = HERE / "config.json"
 
 
+# ---------------- Controller abstraction ----------------
 
-autorestart = config.getboolean("main", "autorestart")
-notele = config.getboolean("main", "notele")
-log.debug("Debug: %s", debug)
-log.debug("verbose: %s", verbose)
-log.debug("autorestart: %s", autorestart)
-log.debug("notele: %s", notele)
-listen_ip = config["listen"]["ip"]
-listen_port = int(config["listen"]["port"])
+class Controller:
+    def __init__(self, cid, kind, name, motors):
+        self.cid = cid
+        self.kind = kind
+        self.name = name
+        self.display_name = name
+        self.color = None  # (r,g,b) or None
+        self.icon = None
+        self.motors = motors  # list of motor labels
+        self._instance = None
 
-osc_output = SimpleUDPClient(config["osc_output"]["ip"],int(config["osc_output"]["port"])) if config["osc_output"]["enabled"] else None
+    def connect(self):
+        return True
 
-relay = config["relay"]
-relay_port = int(relay["port"])
-controllers = config["controllers"]
-if verbose:
-	for key in controllers:
-		print("Finding controller ", key)
+    def rumble(self, motor_index, strength):
+        """strength in [0,1]"""
+        pass
 
+    def stop_all(self):
+        for i in range(len(self.motors)):
+            self.rumble(i, 0.0)
 
-def config_save():
-	with configpath.open("w") as configfile:
-		config.write(configfile)
-
-
-shutdown_everything = False
+    def is_connected(self):
+        return True
 
 
-parser = argparse.ArgumentParser(description="VRChat Joy-Con OSC Connector")
-args = parser.parse_args()
+class JoyConController(Controller):
+    def __init__(self, serial, product_id):
+        super().__init__(f"joycon:{serial}", "joycon",
+                         f"Joy-Con ({'L' if product_id == 0x2006 else 'R'}) {serial}",
+                         ["rumble"])
+        self.serial = serial
+        self.product_id = product_id
+        self._jc = None
 
-def map_range(x, in_min, in_max, out_min, out_max):
-  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min
+    def connect(self):
+        if _JoyConBase is None or hid is None:
+            return False
+        try:
+            ids = None
+            if get_device_ids:
+                for vid, pid, serial in get_device_ids():
+                    if serial == self.serial:
+                        ids = (vid, pid, serial)
+                        break
+            if not ids:
+                return False
+            self._jc = _JoyConBase(*ids)
+            try:
+                body = self._jc.color_body
+                btn = self._jc.color_btn
+                self.color = tuple(int(x) for x in body) if body else None
+                side = "L" if self.product_id == 0x2006 else "R"
+                hexcolor = ""
+                if self.color:
+                    hexcolor = "#{:02x}{:02x}{:02x}".format(*self.color)
+                self.display_name = f"Joy-Con ({side}) {hexcolor}".strip()
+                self.name = self.display_name
+            except Exception:
+                pass
+            return True
+        except Exception as e:
+            log.error("JoyCon connect failed: %s", e)
+            return False
 
-def map_float_remap(path):
-	data=path.split(":",maxsplit=5)
-	myid=data[0]
-	if myid != "float_remap":
-		return None
-	(in_min, in_max, out_min, out_max)=map(float,data[1:5])
-	osc_path=data[5]
+    def rumble(self, motor_index, strength):
+        if not self._jc:
+            return
+        try:
+            if strength and strength > 0:
+                self._jc.rumble_simple()
+            else:
+                self._jc.rumble_stop()
+        except Exception as e:
+            log.error("JoyCon rumble error: %s", e)
 
-	def remapper(input):
-		return map_range(input,in_min, in_max, out_min, out_max)
-	return (remapper,osc_path)
+    def is_connected(self):
+        try:
+            return bool(self._jc) and self._jc.connected()
+        except Exception:
+            return False
 
-def map_int_remap(path):
-	data=path.split(":",maxsplit=5)
-	myid=data[0]
-	if myid != "int_remap":
-		return None
-	(in_min, in_max, out_min, out_max)=map(float,data[1:5])
-	osc_path=data[5]
 
-	def remapper(input):
-		return int(map_range(input,in_min, in_max, out_min, out_max))
-	return (remapper,osc_path)
+class GamepadController(Controller):
+    def __init__(self, index):
+        super().__init__(f"gamepad:{index}", "gamepad", f"Gamepad #{index}", ["low", "high"])
+        self.index = index
+        self._js = None
 
-def map_float(path):
-	data=path.split(":",maxsplit=1)
-	myid=data[0]
-	if myid != "float":
-		return None
-	osc_path=data[1]
+    def connect(self):
+        if pygame is None:
+            return False
+        try:
+            pygame.joystick.init()
+            self._js = pygame.joystick.Joystick(self.index)
+            self._js.init()
+            name = self._js.get_name() or f"Gamepad #{self.index}"
+            self.name = name
+            self.display_name = f"🎮 {name}"
+            self.icon = "🎮"
+            return True
+        except Exception as e:
+            log.error("Gamepad connect failed: %s", e)
+            return False
 
-	def remapper(input):
-		return float(input)
-	
-	return (remapper,osc_path)
+    def rumble(self, motor_index, strength):
+        if not self._js:
+            return
+        try:
+            # pygame rumble takes low/high frequencies
+            low = strength if motor_index == 0 else 0.0
+            high = strength if motor_index == 1 else 0.0
+            if strength and strength > 0:
+                self._js.rumble(low, high, 250)
+            else:
+                self._js.rumble(0, 0, 0)
+        except Exception as e:
+            log.error("Gamepad rumble error: %s", e)
 
-def map_int(path):
-	data=path.split(":",maxsplit=1)
-	myid=data[0]
-	if myid != "int":
-		return None
-	osc_path=data[1]
+    def is_connected(self):
+        try:
+            return bool(self._js) and self._js.get_init()
+        except Exception:
+            return False
 
-	def remapper(input):
-		return int(input)
-	
-	return (remapper,osc_path)
-	
-uniqueifiers={}
-def map_toggle(path):
-	data=path.split(":",maxsplit=3)
-	myid=data[0]
-	if myid != "toggle":
-		return None
-	(myid,uniqueifier,output_type,osc_path)=data
-	uniqueifiers[uniqueifier]=[False,True]
-	def remapper(input):
-		input=bool(input)
 
-		toggledata=uniqueifiers[uniqueifier]
-		(toggle,released_key)=toggledata
-		
-		if input:
-			if released_key:
-				toggle=not toggle
-				toggledata[0]=toggle
-				toggledata[1]=False
-		elif not released_key:
-			toggledata[1]=True
+def discover_controllers():
+    controllers = []
+    # Joy-Cons
+    if get_device_ids is not None:
+        try:
+            for vid, pid, serial in get_device_ids():
+                c = JoyConController(serial, pid)
+                c.connect()
+                controllers.append(c)
+        except Exception as e:
+            log.error("JoyCon discovery error: %s", e)
+    # Gamepads
+    if pygame is not None:
+        try:
+            pygame.joystick.init()
+            for i in range(pygame.joystick.get_count()):
+                c = GamepadController(i)
+                c.connect()
+                controllers.append(c)
+        except Exception as e:
+            log.error("Gamepad discovery error: %s", e)
+    # ensure unique display names
+    seen = {}
+    for c in controllers:
+        base = c.display_name
+        if base in seen:
+            seen[base] += 1
+            c.display_name = f"{base} ({seen[base]})"
+            c.name = c.display_name
+        else:
+            seen[base] = 1
+    return controllers
 
-		if output_type=='bool':
-			return bool(toggle)
-		elif output_type=='int':
-			return int(toggle)
-		elif output_type=='float':
-			return float(toggle)
-		else:
-			log.error(f"INVALID OUTPUT TYPE (from config.ini): {output_type}")
-			return bool(toggle)
-		
-	return (remapper,osc_path)
-	
-def map_bool(path):
-	data=path.split(":",maxsplit=1)
-	myid=data[0]
-	if myid != "bool":
-		return None
-	osc_path=data[1]
 
-	def remapper(input):
-		return bool(input)
-	
-	return (remapper,osc_path)
+# ---------------- Config ----------------
 
-REMAPPERS = [map_toggle,map_float_remap,map_int_remap,map_float,map_int,map_bool]
-
-class JoyConX(JoyCon):
-
-	current_rumble = False
-	rumble_event = None
-	status_getters = False
-
-	def __init__(self, osc_outputs, *identifiers):
-		super().__init__(*identifiers)
-		self.last_gyro_x = 0
-		self.last_a = 0
-		self.rumble_event = asyncio.Event()
-		self.osc_output = osc_output
-		self._build_osc(osc_outputs)
-		if osc_outputs:
-			self.register_update_hook(lambda _: self.on_update_thread())
-		
-	def _build_osc(self,osc_outputs):
-		self.osc_outputs = []
-		status_getters = self.get_status_getters()
-		for controller_path,osc_definition in osc_outputs.items():
-			mapper=None
-			osc_path = osc_definition
-
-			for remapper in REMAPPERS:
-				ret = remapper(osc_definition)
-				if ret:
-					log.info("remapping as requested: %s",osc_definition)
-					assert not mapper,"two mappers taking ownership"
-					(mapper,osc_path) = ret
-				
-			controller_path = controller_path.split(".")
-			try:
-				getter = reduce(operator.getitem, controller_path, status_getters)
-				if not callable(getter):
-					log.error("Omitting %s for %s: not a function",controller_path,id)
-					continue
-			except KeyError as e:
-				log.error("Omitting %s for %s",controller_path,id)
-				log.error(e)
-			self.osc_outputs.append([None,osc_path,getter,mapper])
-		# TODO: not needed? asyncio.run_coroutine_threadsafe()
-
-	def set_rumble(self, f: float):
-		self.rumble_event.set()
-		self.current_rumble = f
-
-	def on_update_thread(self):
-		# print(self.serial,self.get_gyro_x())
-		for data in self.osc_outputs:
-			(prev,osc_path,getter,mapper) = data
-			if mapper:
-				val = mapper(getter())
-			else:
-				val = getter()
-			if prev != val:
-				data[0] = val
-				log.debug(f"send {osc_path} <- {val}")
-				self.osc_output.send_message(osc_path,val)
-
-	def get_status_getters(self) -> dict:
-		if self.status_getters:
-			return self.status_getters
-		add_buttons =  {
-				"y": self.get_button_y,
-				"x": self.get_button_x,
-				"b": self.get_button_b,
-				"a": self.get_button_a,
-				"sr": self.get_button_right_sr,
-				"sl": self.get_button_right_sl,
-				"r": self.get_button_r,
-				"zr": self.get_button_zr,
-			} if self.is_right()  else {
-				"down": self.get_button_down,
-				"up": self.get_button_up,
-				"right": self.get_button_right,
-				"left": self.get_button_left,
-				"sr": self.get_button_left_sr,
-				"sl": self.get_button_left_sl,
-				"l": self.get_button_l,
-				"zl": self.get_button_zl,
-			}
-		buttons = {
-			"minus": self.get_button_minus,
-			"plus": self.get_button_plus,
-			"r-stick": self.get_button_r_stick,
-			"l-stick": self.get_button_l_stick,
-			"home": self.get_button_home,
-			"capture": self.get_button_capture,
-			"charging-grip": self.get_button_charging_grip,
-		}
-		buttons.update(add_buttons)
-		self.status_getters = {
-			"battery": {
-				"charging": self.get_battery_charging,
-				"level": self.get_battery_level,
-			},
-			"buttons": buttons,
-			"analog-sticks": {
-					"horizontal": self.get_stick_left_horizontal,
-					"vertical": self.get_stick_left_vertical,
-				} if self.is_left() else {
-					"horizontal": self.get_stick_right_horizontal,
-					"vertical": self.get_stick_right_vertical,
-				},
-			"accel": {
-				"x": self.get_accel_x,
-				"y": self.get_accel_y,
-				"z": self.get_accel_z,
-			},
-			"gyro": {
-				"x": self.get_gyro_x,
-				"y": self.get_gyro_y,
-				"z": self.get_gyro_z,
-			},
-		}
-		return self.status_getters
-	
-
-joycons: typing.Dict[str, JoyConX | None] = {
-	id: None for id, serial in controllers.items()
+DEFAULT_CONFIG = {
+    "listen": {"ip": "0.0.0.0", "port": 9001},
+    "mappings": [],  # list of {osc_path, controller, motor}
 }
-# lock = threading.Lock()
 
 
-async def joycon_worker(joycon_serial, id):
-	for i in range(13):
-		if shutdown_everything:
-			break
-		joycon_id = False
-
-		while not joycon_id:
-			# TODO: move to thread spawning thread
-
-			for vendor_id, product_id, serial in get_device_ids():
-				if serial == joycon_serial:
-					joycon_id = (vendor_id, product_id, serial)
-					break
-
-			if joycon_id:
-				assert joycon_id[0]
-				break
-			if verbose:
-				log.debug(f"Finding {id}")
-			await asyncio.sleep(0.4421 if not verbose else 2.3)
-
-		name = "Controller-" + str(id)
-		log.info("Found JoyCon %s (%s)\n", name, joycon_id)
-		
-		osc_output_id = "osc_output."+str(id)
-		osc_outputs =  config[osc_output_id] if osc_output_id in config else  None
-		joycon = JoyConX(osc_outputs,*joycon_id)
-		joycons[id] = joycon
-
-
-		joycon.set_player_lamp_on(
-			(int(id) + 1) % 3 + 1
-		)  # required to keep fake controller running
-
-		log.debug("Testing vibration")
-		await asyncio.sleep(1)
-
-		joycon.rumble_simple()
-		await asyncio.sleep(1.5)
-
-		joycon.rumble_simple()
-		await asyncio.sleep(0.5)
-
-		joycon.rumble_stop()
-		log.debug("Vibrated")
-		if notele:
-			await asyncio.sleep(0.02)
-
-			await asyncio.sleep(0.02)
-			joycon._write_output_report(b"\x01", b"\x03", b"\x00")
-
-		while not shutdown_everything and joycon.connected():
-			await joycon.rumble_event.wait()
-
-			status = joycon.current_rumble
-			if status:
-
-				joycon.rumble_simple()
-				if verbose:
-					# too spammy even for debug
-					log.debug("Vibrating %s @ %s", name, str(status))
-
-				await asyncio.sleep(0.35)
-
-			elif status is not False:
-				joycon.current_rumble = False
-				log.debug("STOP %s", name)
-				joycon.rumble_event.clear()
-				joycon.rumble_stop()
-
-		log.error("LOST JOYCON %s", name)
-
-		del joycon
-		joycons[id] = False
-	log.critical(f"TOO MANY FAILURES, CLOSING {id}")
-
-
-controller_tasks = []
-server_osc: osc_server.AsyncIOOSCUDPServer = None
-osc_relayer: SimpleUDPClient = None
-
-#TODO: untested
-def gen_relay(relayinfo,dispatcher):
-	relay = SimpleUDPClient(relayinfo["ip"],int(relayinfo["port"]))
-	remappings={k:v for k,v in relayinfo.items() if k!="ip" and k!="port"}
-	for map_from,map_to in remappings.items():
-		log.info(" - Relaying '%s' as '%s'",map_from,map_to)
-		dispatcher.map(map_from, (lambda map_to=map_to: lambda _,*args: relay.send_message(map_to,args))() )
-
-async def startOSC(loop):
-	global server_osc, osc_relayer
-
-	def default_handler(key, *vals):
-		if osc_relayer:
-			osc_relayer.send_message(key, vals)
-		if verbose:
-			logging.error("osc received unhandled: %s %s", key, vals)
-
-	def osc_rumble(id, address, *args):
-		log.debug(
-			"osc_rumble(id=%s,address=%s,*args=%s)", str(id), str(address), str(args)
-		)
-		j: JoyConX | None = joycons.get(id, None)
-		if not j:
-			log.debug("CANNOT RUMBLE CONTROLLER %s (does not exist)", id)
-			return
-
-		val = 0
-		if len(args) > 0:
-			val = args[0]
-			if isinstance(val, list):
-				if len(val) == 0:
-					log.error(f"Unhandled {id} {address} {val}")
-					return
-				val = val[0]
-
-		rumble_strength = 0
-		if type(val) == int or type(val) == float:
-			rumble_strength = val
-		elif type(val) == bool:
-			rumble_strength = 1 if val else 0
-		else:
-			log.error("Unknown type received")
-
-		log.info(f"JoyCon {id}: set_rumble(rumble_strength={rumble_strength})")
-		j.set_rumble(rumble_strength)
-
-	d = dispatcher.Dispatcher()
-
-	for id, osc_paths in config["osc.rumble"].items():
-		for osc_path in osc_paths.splitlines():
-			# def handler(address,*args):
-			# 	osc_rumble(id,address,*args)
-
-			# Captures id
-			handler = (
-				lambda id: lambda address, *args: osc_rumble(id, address, *args)
-			)(id)
-			d.map(osc_path, handler)  # We could use the extra param here also
-
-			log.debug("Map %s <- %s", id, osc_path)
-	if relay_port > 0:
-		d.set_default_handler(default_handler)
-
-	server_osc = osc_server.AsyncIOOSCUDPServer((listen_ip, listen_port), d, loop)
-	log.info(f"[osc_server] listen_ip={listen_ip} listen_port={listen_port}")
-	(
-		transport,
-		protocol,
-	) = (
-		await server_osc.create_serve_endpoint()
-	)  # Create datagram endpoint and start serving
-
-	if relay_port > 0:
-		osc_relayer = SimpleUDPClient(relay["ip"], relay_port)
-		log.info(
-			"Relaying other messages to {} on port {}".format(relay["ip"], relay_port)
-		)
-
-	for relayinfo in [config[sect] for sect in config.sections() if sect.startswith("relay.")]:
-		if int(relayinfo["port"])>0:
-			log.info("Creating relay to %s port %s",relayinfo["ip"],relayinfo["port"])
-			gen_relay(relayinfo,d)
-
-
-
-def watchdog():
-	while True:
-		anyAlive = False
-		for t in controller_tasks:
-			t.join(0.2)
-			if t.is_alive():
-				anyAlive = True
-		if not anyAlive:
-			global shutdown_everything
-			shutdown_everything = True
-			log.critical("Lost all JoyCon threads")
-			# print("\nFATAL: Lost all JoyCon threads\n")
-			return
-		"""
-		
-		hadAny=False
-		anyAlive=False
-		for id,c in enumerate(joycons):
-			if c==False:
-				continue
-			hadAny=True
-
-			# TODO: Race condition here?
-			c._update_input_report_thread.join(0.2)
-			if c._update_input_report_thread.is_alive():
-				anyAlive=True
-
-		if hadAny and not anyAlive:
-			server.shutdown()
-			print("\nFATAL: Lost all JoyCons\n")
-			return
-		
-		"""
-
-
-async def startJoyCons():
-	log.info(
-		"Attempting to locate joycons. Known controllers: %s",
-		{k: v for k, v in controllers.items()},
-	)
-	if len(controllers) == 0 or False:
-		print("ATTENTION: Start all joycons (to discover serial IDs")
-		print("THEN:    modify config.ini to set up proper ids for your osc...")
-		found = []
-		while not shutdown_everything:
-
-			for vendor_id, product_id, serial in get_device_ids():
-				if serial not in found:
-					found.append(serial)
-					id = len(found)
-					controllers[str(id)] = serial
-					print(
-						"Saving found: ",
-						f"vendor_id={vendor_id}, product_id={product_id}, serial={serial} id={id}",
-						"LEFT" if product_id == 0x2006 else "RIGHT",
-					)
-					print("Type exit and press enter to save! Then restart vrcjoycon.")
-					config_save()
-
-			sys.stdout.write(".")
-			sys.stdout.flush()
-			await asyncio.sleep(2.123)
-		print("Stopping joycon discovery")
-		return
-
-	for id, serial in controllers.items():
-		# x = threading.Thread(target=joycon_worker,
-		# 					 args=(serial, id), daemon=True,name="joyconController"+str(id))
-		# x.start()
-		x = asyncio.create_task(joycon_worker(serial, id),name="JoyConController-"+str(id))
-		
-		controller_tasks.append(x)
-
-	# Watchdog
-	# x = threading.Thread(target=watchdog,
-	# 						args=(), daemon=True,name="watchdog")
-	# x.start()
-
-
-do_status_args = argparse.ArgumentParser(description="Random status info")
-
-import pprint
-async def do_status(reader, writer):
-	for id,con in joycons.items():
-		print("JOYCON: ",id,"=",con)
-		if con:
-			print("        Connected=",con.connected(),"status=")
-			pprint.pprint(con.get_status())
-
-
-
-do_exit_args = argparse.ArgumentParser(description="Exits")
-
-
-async def do_exit(reader, writer):
-	log.warning("Setting shutdown_everything=True ...")
-	global shutdown_everything
-	shutdown_everything = True
-
-
-
-do_tasks_args = argparse.ArgumentParser(description="List tasks")
-
-
-async def do_tasks(reader, writer):
-	for task in asyncio.all_tasks():
-		print(task)
-
-do_vibrate_args = argparse.ArgumentParser(description="Vibrates a controller")
-do_vibrate_args.add_argument("id", nargs='?',default="1", help="controller id")
-
-
-async def do_vibrate(reader, writer, id=1):
-	log.warning(f"vibrating {id}")
-	joycon = joycons.get(id)
-	if joycon:
-		joycon.set_rumble(1)
-		await asyncio.sleep(3)
-		joycon.set_rumble(0)
-	else:
-		writer.write("no such joycon\n")
-
-
-CLI_CMDS = {"vibrate": (do_vibrate, do_vibrate_args), "status": (do_status, do_status_args), "exit": (do_exit, do_exit_args), "tasks": (do_tasks, do_tasks_args)}
-
-async def startCLI(loop):
-
-	cli = AsynchronousCli(CLI_CMDS, prog="cvrcjoycon", loop=loop)
-	await cli.interact()
-
-async def amain():
-
-	loop = asyncio.get_event_loop()
-
-	await startOSC(loop)
-	
-
-	jcstarter=asyncio.create_task(startJoyCons(),name="startJoyCons")
-	clitask=asyncio.create_task(startCLI(loop),name="CLI")
-
-	while not shutdown_everything:
-		for task in controller_tasks:
-			try:
-				task.result()
-			except asyncio.InvalidStateError:
-				pass
-		try:
-			jcstarter.result()
-		except asyncio.InvalidStateError:
-			pass
-
-		await asyncio.wait([clitask],timeout=1.234)
-		
-	log.info("shutdown_everything=1")
-	for task in asyncio.all_tasks():
-		task.cancel()
-
-	# cmd = Commander(intro="===== VR JoyCon Command Prompt =====", prompt="vrcjoycon> ")
-	# cmd.start(loop)
+def load_config():
+    if CONFIG_PATH.exists():
+        try:
+            with CONFIG_PATH.open() as f:
+                data = json.load(f)
+            # merge defaults
+            for k, v in DEFAULT_CONFIG.items():
+                data.setdefault(k, v)
+            return data
+        except Exception as e:
+            log.error("Config load error: %s", e)
+    return json.loads(json.dumps(DEFAULT_CONFIG))
+
+
+def save_config(cfg):
+    try:
+        with CONFIG_PATH.open("w") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception as e:
+        log.error("Config save error: %s", e)
+
+
+# ---------------- OSC Bridge ----------------
+
+class OscBridge:
+    def __init__(self, cfg, controllers, log_cb):
+        self.cfg = cfg
+        self.controllers = {c.cid: c for c in controllers}
+        self.log_cb = log_cb
+        self.server = None
+        self.transport = None
+        self.protocol = None
+        self.loop = None
+        self.thread = None
+        self.running = False
+        self.mappings = {}  # osc_path -> (controller_id, motor_index)
+        self._rebuild_mappings()
+
+    def _rebuild_mappings(self):
+        self.mappings = {}
+        for m in self.cfg.get("mappings", []):
+            self.mappings[m["osc_path"]] = (m["controller"], m["motor"])
+
+    def update_controllers(self, controllers):
+        self.controllers = {c.cid: c for c in controllers}
+
+    def update_config(self, cfg):
+        self.cfg = cfg
+        self._rebuild_mappings()
+
+    def start(self):
+        if self.running:
+            return
+        self.running = True
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.running = False
+        if self.loop:
+            try:
+                self.loop.call_soon_threadsafe(self.loop.stop)
+            except Exception:
+                pass
+
+    def _run(self):
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        try:
+            self.loop.run_until_complete(self._serve())
+        except Exception as e:
+            self.log_cb(f"OSC server error: {e}")
+        finally:
+            self.running = False
+
+    async def _serve(self):
+        ip = self.cfg["listen"]["ip"]
+        port = int(self.cfg["listen"]["port"])
+
+        def handler(address, *args):
+            self._handle(address, *args)
+
+        d = dispatcher.Dispatcher()
+        # map each configured path
+        for path in list(self.mappings.keys()):
+            d.map(path, lambda address, *args, p=path: self._handle(p, *args))
+        d.set_default_handler(lambda address, *args: self._default(address, *args))
+
+        self.server = osc_server.AsyncIOOSCUDPServer((ip, port), d, self.loop)
+        self.log_cb(f"OSC server listening on {ip}:{port}")
+        transport, protocol = await self.server.create_serve_endpoint()
+        self.transport = transport
+        # keep running
+        while self.running:
+            await asyncio.sleep(0.5)
+        try:
+            transport.close()
+        except Exception:
+            pass
+
+    def _handle(self, path, *args):
+        mapping = self.mappings.get(path)
+        if not mapping:
+            return
+        cid, motor = mapping
+        ctrl = self.controllers.get(cid)
+        if not ctrl:
+            self.log_cb(f"No controller {cid} for {path}")
+            return
+        val = 0.0
+        if args:
+            v = args[0]
+            if isinstance(v, (list, tuple)) and v:
+                v = v[0]
+            try:
+                if isinstance(v, bool):
+                    val = 1.0 if v else 0.0
+                else:
+                    val = float(v)
+            except Exception:
+                val = 1.0 if v else 0.0
+        try:
+            ctrl.rumble(int(motor), val)
+            self.log_cb(f"{path} -> {cid} motor {motor}: {val}")
+        except Exception as e:
+            self.log_cb(f"Rumble error: {e}")
+
+    def _default(self, address, *args):
+        # unhandled; could relay
+        pass
+
+
+# ---------------- UI ----------------
+
+class App:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("VRCJoyCon")
+        self.cfg = load_config()
+        self.controllers = discover_controllers()
+        # connect controllers
+        for c in self.controllers:
+            c.connect()
+        self.bridge = OscBridge(self.cfg, self.controllers, self._log)
+        self._build_ui()
+        self._refresh_controller_list()
+        self._refresh_mapping_list()
+
+    def _build_ui(self):
+        nb = ttk.Notebook(self.root)
+        nb.pack(fill="both", expand=True)
+
+        # Controllers tab
+        tab_ctrl = ttk.Frame(nb)
+        nb.add(tab_ctrl, text="Controllers")
+        ttk.Label(tab_ctrl, text="Discovered controllers").pack(anchor="w", padx=5, pady=5)
+        self.ctrl_container = ttk.Frame(tab_ctrl)
+        self.ctrl_container.pack(fill="both", expand=True, padx=5)
+        btnf = ttk.Frame(tab_ctrl)
+        btnf.pack(fill="x", padx=5, pady=5)
+        ttk.Button(btnf, text="Refresh", command=self._on_refresh_controllers).pack(side="left")
+        ttk.Button(btnf, text="Connect All", command=self._on_connect_all).pack(side="left", padx=5)
+
+        # Mappings tab
+        tab_map = ttk.Frame(nb)
+        nb.add(tab_map, text="Mappings")
+        cols = ("osc", "controller", "motor")
+        self.map_tree = ttk.Treeview(tab_map, columns=cols, show="headings", height=12)
+        for c, t in zip(cols, ("OSC Parameter", "Controller", "Motor")):
+            self.map_tree.heading(c, text=t)
+        self.map_tree.pack(fill="both", expand=True, padx=5, pady=5)
+
+        form = ttk.Frame(tab_map)
+        form.pack(fill="x", padx=5, pady=5)
+        ttk.Label(form, text="OSC path").grid(row=0, column=0)
+        self.osc_entry = ttk.Entry(form, width=30)
+        self.osc_entry.grid(row=0, column=1, padx=5)
+        ttk.Label(form, text="Controller").grid(row=0, column=2)
+        self.ctrl_combo = ttk.Combobox(form, values=[], width=25)
+        self.ctrl_combo.grid(row=0, column=3, padx=5)
+        self.ctrl_combo.bind("<<ComboboxSelected>>", lambda e: self._update_motor_combo())
+        ttk.Label(form, text="Motor").grid(row=0, column=4)
+        self.motor_combo = ttk.Combobox(form, values=[], width=10)
+        self.motor_combo.grid(row=0, column=5, padx=5)
+
+        bf = ttk.Frame(tab_map)
+        bf.pack(fill="x", padx=5, pady=5)
+        ttk.Button(bf, text="Add/Update", command=self._on_add_mapping).pack(side="left")
+        ttk.Button(bf, text="Delete", command=self._on_delete_mapping).pack(side="left", padx=5)
+        ttk.Button(bf, text="Save", command=self._on_save_mappings).pack(side="left", padx=5)
+
+        # Settings tab
+        tab_set = ttk.Frame(nb)
+        nb.add(tab_set, text="Settings")
+        ttk.Label(tab_set, text="Listen IP").grid(row=0, column=0, padx=5, pady=5)
+        self.listen_ip = ttk.Entry(tab_set, width=20)
+        self.listen_ip.insert(0, self.cfg["listen"]["ip"])
+        self.listen_ip.grid(row=0, column=1)
+        ttk.Label(tab_set, text="Listen Port").grid(row=0, column=2, padx=5)
+        self.listen_port = ttk.Entry(tab_set, width=8)
+        self.listen_port.insert(0, str(self.cfg["listen"]["port"]))
+        self.listen_port.grid(row=0, column=3)
+
+        # Log tab
+        tab_log = ttk.Frame(nb)
+        nb.add(tab_log, text="Log")
+        self.log_text = scrolledtext.ScrolledText(tab_log, height=15)
+        self.log_text.pack(fill="both", expand=True, padx=5, pady=5)
+
+        # Bottom controls
+        bottom = ttk.Frame(self.root)
+        bottom.pack(fill="x", padx=5, pady=5)
+        ttk.Button(bottom, text="Start OSC Server", command=self._on_start).pack(side="left")
+        ttk.Button(bottom, text="Stop OSC Server", command=self._on_stop).pack(side="left", padx=5)
+
+    def _log(self, msg):
+        def _do():
+            self.log_text.insert("end", msg + "\n")
+            self.log_text.see("end")
+        try:
+            self.root.after(0, _do)
+        except Exception:
+            print(msg)
+
+    def _display_name_for(self, cid):
+        for c in self.controllers:
+            if c.cid == cid:
+                return c.display_name
+        return cid
+
+    def _cid_for_display(self, name):
+        for c in self.controllers:
+            if c.display_name == name:
+                return c.cid
+        return name
+
+    def _refresh_controller_list(self):
+        for w in self.ctrl_container.winfo_children():
+            w.destroy()
+        for c in self.controllers:
+            status = "connected" if c.is_connected() else "disconnected"
+            row = ttk.Frame(self.ctrl_container)
+            row.pack(fill="x", pady=2)
+            # color swatch / icon
+            if c.color:
+                sw = tk.Canvas(row, width=24, height=24, highlightthickness=1)
+                sw.pack(side="left", padx=4)
+                hexcolor = "#{:02x}{:02x}{:02x}".format(*c.color)
+                sw.create_rectangle(0, 0, 24, 24, fill=hexcolor, outline="#333")
+            elif c.icon:
+                ttk.Label(row, text=c.icon, font=("TkDefaultFont", 14)).pack(side="left", padx=4)
+            else:
+                ttk.Label(row, text="🎮", font=("TkDefaultFont", 14)).pack(side="left", padx=4)
+            ttk.Label(row, text=f"{c.display_name}  [{status}]  motors={c.motors}").pack(side="left", padx=4)
+        # update combo with display names
+        self.ctrl_combo["values"] = [c.display_name for c in self.controllers]
+        if self.controllers and not self.ctrl_combo.get():
+            self.ctrl_combo.set(self.controllers[0].display_name)
+        self._update_motor_combo()
+
+    def _update_motor_combo(self):
+        name = self.ctrl_combo.get()
+        ctrl = next((c for c in self.controllers if c.display_name == name), None)
+        if ctrl:
+            self.motor_combo["values"] = list(range(len(ctrl.motors)))
+            if not self.motor_combo.get():
+                self.motor_combo.set("0")
+
+    def _refresh_mapping_list(self):
+        for item in self.map_tree.get_children():
+            self.map_tree.delete(item)
+        for m in self.cfg.get("mappings", []):
+            self.map_tree.insert("", "end", values=(m["osc_path"], self._display_name_for(m["controller"]), m["motor"]))
+
+    def _on_refresh_controllers(self):
+        self.controllers = discover_controllers()
+        for c in self.controllers:
+            c.connect()
+        self.bridge.update_controllers(self.controllers)
+        self._refresh_controller_list()
+        self._log("Controllers refreshed")
+
+    def _on_connect_all(self):
+        for c in self.controllers:
+            c.connect()
+        self._refresh_controller_list()
+
+    def _on_add_mapping(self):
+        path = self.osc_entry.get().strip()
+        name = self.ctrl_combo.get().strip()
+        cid = self._cid_for_display(name)
+        motor = self.motor_combo.get().strip()
+        if not path or not cid:
+            messagebox.showwarning("Missing", "OSC path and controller required")
+            return
+        try:
+            motor_i = int(motor)
+        except ValueError:
+            motor_i = 0
+        # replace existing
+        mappings = [m for m in self.cfg["mappings"] if m["osc_path"] != path]
+        mappings.append({"osc_path": path, "controller": cid, "motor": motor_i})
+        self.cfg["mappings"] = mappings
+        self.bridge.update_config(self.cfg)
+        self._refresh_mapping_list()
+        self._log(f"Mapping added: {path} -> {cid} motor {motor_i}")
+
+    def _on_delete_mapping(self):
+        sel = self.map_tree.selection()
+        if not sel:
+            return
+        vals = self.map_tree.item(sel[0], "values")
+        path = vals[0]
+        self.cfg["mappings"] = [m for m in self.cfg["mappings"] if m["osc_path"] != path]
+        self.bridge.update_config(self.cfg)
+        self._refresh_mapping_list()
+
+    def _on_save_mappings(self):
+        # update listen settings from entries
+        self.cfg["listen"]["ip"] = self.listen_ip.get().strip() or "0.0.0.0"
+        try:
+            self.cfg["listen"]["port"] = int(self.listen_port.get().strip())
+        except ValueError:
+            pass
+        save_config(self.cfg)
+        self.bridge.update_config(self.cfg)
+        self._log("Config saved")
+
+    def _on_start(self):
+        self._on_save_mappings()
+        self.bridge.start()
+        self._log("Starting OSC server")
+
+    def _on_stop(self):
+        self.bridge.stop()
+        self._log("Stopping OSC server")
+
+
+def main():
+    root = tk.Tk()
+    app = App(root)
+    root.geometry("720x520")
+    root.mainloop()
 
 
 if __name__ == "__main__":
-	try:
-		asyncio.run(amain(),debug=debug)
-	except SystemExit as e:
-		pass	
-	except Exception as e:
-		if verbose or debug:
-			
-			try:
-				#TODO: BUG: aioconsole likely closes stdin/stderr/etc...
-				input("SHUTTING DOWN. PRESS ENTER TO CLOSE.")
-			except Exception:
-				pass
-
-		raise
-
-	# server.serve_forever()
+    main()

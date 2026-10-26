@@ -6,13 +6,14 @@ authors = ["python1320 <python1320@users.noreply.github.com>"]
 readme = "README.md"
 
 [tool.poetry.dependencies]
-python = ">=3.11,<3.12"
+python = ">=3.11"
 coloredlogs = "^15.0.1"
 PyGLM = "^2.7.0"
 python-osc = "^1.8.1"
 aioconsole = "^0.6.1"
 configobj = "^5.0.8"
 hid = "^1.0.5"
+pygame = "^2.6.0"
 
 [tool.poetry.group.dev.dependencies]
 pyinstaller = "^5.9.0"

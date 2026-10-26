@@ -1,6 +1,9 @@
 from .joycon import JoyCon
 from .wrappers import PythonicJoyCon  # as JoyCon
-from .gyro import GyroTrackingJoyCon
+try:
+    from .gyro import GyroTrackingJoyCon
+except Exception:
+    GyroTrackingJoyCon = None
 from .event import ButtonEventJoyCon
 from .device import get_device_ids, get_ids_of_type
 from .device import is_id_L
