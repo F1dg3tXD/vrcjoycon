@@ -319,7 +319,9 @@ class OscBridge:
 
     async def _serve(self):
         import asyncio
-        ip = self.cfg["listen"]["ip"]
+        raw_ip = str(self.cfg["listen"]["ip"]).strip()
+        if raw_ip.lower() in ("any", "*", "", "all"):
+            raw_ip = "0.0.0.0"
         port = int(self.cfg["listen"]["port"])
 
         d = dispatcher.Dispatcher()
@@ -327,9 +329,17 @@ class OscBridge:
             d.map(path, lambda address, *args, p=path: self._handle(p, *args))
         d.set_default_handler(lambda address, *args: None)
 
-        self.server = osc_server.AsyncIOOSCUDPServer((ip, port), d, self.loop)
-        self._log(f"OSC server listening on {ip}:{port}")
-        transport, protocol = await self.server.create_serve_endpoint()
+        ip = raw_ip
+        try:
+            self.server = osc_server.AsyncIOOSCUDPServer((ip, port), d, self.loop)
+            self._log(f"OSC server listening on {ip}:{port}")
+            transport, protocol = await self.server.create_serve_endpoint()
+        except OSError as e:
+            self._log(f"Cannot bind to {ip}:{port} ({e}); falling back to 0.0.0.0")
+            ip = "0.0.0.0"
+            self.server = osc_server.AsyncIOOSCUDPServer((ip, port), d, self.loop)
+            self._log(f"OSC server listening on {ip}:{port}")
+            transport, protocol = await self.server.create_serve_endpoint()
         self.transport = transport
         while self.running:
             await asyncio.sleep(0.5)
