@@ -2,30 +2,23 @@
 """VRCJoyCon - cross-platform OSC haptics controller.
 
 Maps VRChat/ChilloutVR OSC parameters to rumble motors on Nintendo Switch
-Joy-Cons and standard gamepads. Provides a Tkinter UI for assigning
+Joy-Cons and standard gamepads. Provides a PySide6 UI for assigning
 parameters, controllers and motors, plus a standard OSC UDP server.
 """
 
-import argparse
-import asyncio
 import json
 import logging
 import os
 import sys
 import threading
-import time
 from pathlib import Path
 
-# Ensure local imports work when run as script
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("VRCJOYCON")
-
-import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext
 
 # Optional heavy deps
 try:
@@ -49,9 +42,29 @@ except Exception as e:
     log.warning("pygame unavailable: %s", e)
 
 from pythonosc import dispatcher, osc_server
-from pythonosc.udp_client import SimpleUDPClient
+
+from PySide6.QtCore import QObject, Qt, Signal, Slot
+from PySide6.QtGui import QColor, QIcon, QPalette
+from PySide6.QtWidgets import (
+    QApplication, QComboBox, QFormLayout, QFrame, QHBoxLayout, QLabel,
+    QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QPushButton,
+    QScrollArea, QSpinBox, QSplitter, QTabWidget, QTableWidget,
+    QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
+)
 
 CONFIG_PATH = HERE / "config.json"
+
+
+def find_image(name):
+    candidates = []
+    if getattr(sys, "_MEIPASS", None):
+        candidates.append(Path(sys._MEIPASS) / "images" / name)
+    candidates.append(HERE / "images" / name)
+    candidates.append(HERE.parent / "images" / name)
+    for c in candidates:
+        if c.exists():
+            return c
+    return candidates[-1]
 
 
 # ---------------- Controller abstraction ----------------
@@ -62,16 +75,15 @@ class Controller:
         self.kind = kind
         self.name = name
         self.display_name = name
-        self.color = None  # (r,g,b) or None
+        self.color = None
         self.icon = None
-        self.motors = motors  # list of motor labels
+        self.motors = motors
         self._instance = None
 
     def connect(self):
         return True
 
     def rumble(self, motor_index, strength):
-        """strength in [0,1]"""
         pass
 
     def stop_all(self):
@@ -85,7 +97,7 @@ class Controller:
 class JoyConController(Controller):
     def __init__(self, serial, product_id):
         super().__init__(f"joycon:{serial}", "joycon",
-                         f"Joy-Con ({'L' if product_id == 0x2006 else 'R'}) {serial}",
+                         f"Joy-Con ({'L' if product_id == 0x2006 else 'R'})",
                          ["rumble"])
         self.serial = serial
         self.product_id = product_id
@@ -106,8 +118,8 @@ class JoyConController(Controller):
             self._jc = _JoyConBase(*ids)
             try:
                 body = self._jc.color_body
-                btn = self._jc.color_btn
-                self.color = tuple(int(x) for x in body) if body else None
+                if body:
+                    self.color = tuple(int(x) for x in body)
                 side = "L" if self.product_id == 0x2006 else "R"
                 hexcolor = ""
                 if self.color:
@@ -165,7 +177,6 @@ class GamepadController(Controller):
         if not self._js:
             return
         try:
-            # pygame rumble takes low/high frequencies
             low = strength if motor_index == 0 else 0.0
             high = strength if motor_index == 1 else 0.0
             if strength and strength > 0:
@@ -184,7 +195,6 @@ class GamepadController(Controller):
 
 def discover_controllers():
     controllers = []
-    # Joy-Cons
     if get_device_ids is not None:
         try:
             for vid, pid, serial in get_device_ids():
@@ -193,7 +203,6 @@ def discover_controllers():
                 controllers.append(c)
         except Exception as e:
             log.error("JoyCon discovery error: %s", e)
-    # Gamepads
     if pygame is not None:
         try:
             pygame.joystick.init()
@@ -203,7 +212,6 @@ def discover_controllers():
                 controllers.append(c)
         except Exception as e:
             log.error("Gamepad discovery error: %s", e)
-    # ensure unique display names
     seen = {}
     for c in controllers:
         base = c.display_name
@@ -220,7 +228,7 @@ def discover_controllers():
 
 DEFAULT_CONFIG = {
     "listen": {"ip": "0.0.0.0", "port": 9001},
-    "mappings": [],  # list of {osc_path, controller, motor}
+    "mappings": [],
 }
 
 
@@ -229,7 +237,6 @@ def load_config():
         try:
             with CONFIG_PATH.open() as f:
                 data = json.load(f)
-            # merge defaults
             for k, v in DEFAULT_CONFIG.items():
                 data.setdefault(k, v)
             return data
@@ -248,19 +255,28 @@ def save_config(cfg):
 
 # ---------------- OSC Bridge ----------------
 
+class LogEmitter(QObject):
+    message = Signal(str)
+
+
 class OscBridge:
-    def __init__(self, cfg, controllers, log_cb):
+    def __init__(self, cfg, controllers, emitter):
         self.cfg = cfg
         self.controllers = {c.cid: c for c in controllers}
-        self.log_cb = log_cb
+        self.emitter = emitter
+        self.running = False
+        self.thread = None
+        self.loop = None
         self.server = None
         self.transport = None
-        self.protocol = None
-        self.loop = None
-        self.thread = None
-        self.running = False
-        self.mappings = {}  # osc_path -> (controller_id, motor_index)
+        self.mappings = {}
         self._rebuild_mappings()
+
+    def _log(self, msg):
+        try:
+            self.emitter.message.emit(msg)
+        except Exception:
+            print(msg)
 
     def _rebuild_mappings(self):
         self.mappings = {}
@@ -290,33 +306,31 @@ class OscBridge:
                 pass
 
     def _run(self):
-        self.loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self.loop)
+        self.loop = None
         try:
+            import asyncio
+            self.loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.loop)
             self.loop.run_until_complete(self._serve())
         except Exception as e:
-            self.log_cb(f"OSC server error: {e}")
+            self._log(f"OSC server error: {e}")
         finally:
             self.running = False
 
     async def _serve(self):
+        import asyncio
         ip = self.cfg["listen"]["ip"]
         port = int(self.cfg["listen"]["port"])
 
-        def handler(address, *args):
-            self._handle(address, *args)
-
         d = dispatcher.Dispatcher()
-        # map each configured path
         for path in list(self.mappings.keys()):
             d.map(path, lambda address, *args, p=path: self._handle(p, *args))
-        d.set_default_handler(lambda address, *args: self._default(address, *args))
+        d.set_default_handler(lambda address, *args: None)
 
         self.server = osc_server.AsyncIOOSCUDPServer((ip, port), d, self.loop)
-        self.log_cb(f"OSC server listening on {ip}:{port}")
+        self._log(f"OSC server listening on {ip}:{port}")
         transport, protocol = await self.server.create_serve_endpoint()
         self.transport = transport
-        # keep running
         while self.running:
             await asyncio.sleep(0.5)
         try:
@@ -331,7 +345,7 @@ class OscBridge:
         cid, motor = mapping
         ctrl = self.controllers.get(cid)
         if not ctrl:
-            self.log_cb(f"No controller {cid} for {path}")
+            self._log(f"No controller {cid} for {path}")
             return
         val = 0.0
         if args:
@@ -347,106 +361,152 @@ class OscBridge:
                 val = 1.0 if v else 0.0
         try:
             ctrl.rumble(int(motor), val)
-            self.log_cb(f"{path} -> {cid} motor {motor}: {val}")
+            self._log(f"{path} -> {cid} motor {motor}: {val}")
         except Exception as e:
-            self.log_cb(f"Rumble error: {e}")
-
-    def _default(self, address, *args):
-        # unhandled; could relay
-        pass
+            self._log(f"Rumble error: {e}")
 
 
 # ---------------- UI ----------------
 
-class App:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("VRCJoyCon")
+class ControllerRow(QWidget):
+    def __init__(self, controller):
+        super().__init__()
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 2, 4, 2)
+        if controller.color:
+            sw = QFrame()
+            sw.setFixedSize(24, 24)
+            r, g, b = controller.color
+            sw.setStyleSheet(f"background-color: rgb({r},{g},{b}); border: 1px solid #555; border-radius: 4px;")
+            layout.addWidget(sw)
+        else:
+            icon = QLabel(controller.icon or "🎮")
+            icon.setStyleSheet("font-size: 16px;")
+            layout.addWidget(icon)
+        layout.addWidget(QLabel(controller.display_name))
+        status = "connected" if controller.is_connected() else "disconnected"
+        st = QLabel(f"[{status}]")
+        st.setStyleSheet("color: gray;")
+        layout.addWidget(st)
+        layout.addWidget(QLabel(f"motors={controller.motors}"))
+        layout.addStretch()
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("VRCJoyCon")
+        icon_path = find_image("app.ico" if sys.platform.startswith("win") else "app.png")
+        if icon_path.exists():
+            self.setWindowIcon(QIcon(str(icon_path)))
+
         self.cfg = load_config()
         self.controllers = discover_controllers()
-        # connect controllers
-        for c in self.controllers:
-            c.connect()
-        self.bridge = OscBridge(self.cfg, self.controllers, self._log)
+        self.emitter = LogEmitter()
+        self.bridge = OscBridge(self.cfg, self.controllers, self.emitter)
+        self.emitter.message.connect(self._append_log)
+
         self._build_ui()
         self._refresh_controller_list()
         self._refresh_mapping_list()
 
+        # theme responsiveness
+        hints = QApplication.instance().styleHints()
+        hints.colorSchemeChanged.connect(self._on_scheme_changed)
+
     def _build_ui(self):
-        nb = ttk.Notebook(self.root)
-        nb.pack(fill="both", expand=True)
+        central = QWidget()
+        self.setCentralWidget(central)
+        root_layout = QVBoxLayout(central)
+
+        self.tabs = QTabWidget()
+        root_layout.addWidget(self.tabs, 1)
 
         # Controllers tab
-        tab_ctrl = ttk.Frame(nb)
-        nb.add(tab_ctrl, text="Controllers")
-        ttk.Label(tab_ctrl, text="Discovered controllers").pack(anchor="w", padx=5, pady=5)
-        self.ctrl_container = ttk.Frame(tab_ctrl)
-        self.ctrl_container.pack(fill="both", expand=True, padx=5)
-        btnf = ttk.Frame(tab_ctrl)
-        btnf.pack(fill="x", padx=5, pady=5)
-        ttk.Button(btnf, text="Refresh", command=self._on_refresh_controllers).pack(side="left")
-        ttk.Button(btnf, text="Connect All", command=self._on_connect_all).pack(side="left", padx=5)
+        ctrl_tab = QWidget()
+        ctrl_layout = QVBoxLayout(ctrl_tab)
+        ctrl_layout.addWidget(QLabel("Discovered controllers"))
+        self.ctrl_list = QListWidget()
+        ctrl_layout.addWidget(self.ctrl_list, 1)
+        btn_row = QHBoxLayout()
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.clicked.connect(self._on_refresh_controllers)
+        connect_btn = QPushButton("Connect All")
+        connect_btn.clicked.connect(self._on_connect_all)
+        btn_row.addWidget(refresh_btn)
+        btn_row.addWidget(connect_btn)
+        btn_row.addStretch()
+        ctrl_layout.addLayout(btn_row)
+        self.tabs.addTab(ctrl_tab, "Controllers")
 
         # Mappings tab
-        tab_map = ttk.Frame(nb)
-        nb.add(tab_map, text="Mappings")
-        cols = ("osc", "controller", "motor")
-        self.map_tree = ttk.Treeview(tab_map, columns=cols, show="headings", height=12)
-        for c, t in zip(cols, ("OSC Parameter", "Controller", "Motor")):
-            self.map_tree.heading(c, text=t)
-        self.map_tree.pack(fill="both", expand=True, padx=5, pady=5)
+        map_tab = QWidget()
+        map_layout = QVBoxLayout(map_tab)
+        self.map_table = QTableWidget(0, 3)
+        self.map_table.setHorizontalHeaderLabels(["OSC Parameter", "Controller", "Motor"])
+        self.map_table.horizontalHeader().setStretchLastSection(True)
+        map_layout.addWidget(self.map_table, 1)
 
-        form = ttk.Frame(tab_map)
-        form.pack(fill="x", padx=5, pady=5)
-        ttk.Label(form, text="OSC path").grid(row=0, column=0)
-        self.osc_entry = ttk.Entry(form, width=30)
-        self.osc_entry.grid(row=0, column=1, padx=5)
-        ttk.Label(form, text="Controller").grid(row=0, column=2)
-        self.ctrl_combo = ttk.Combobox(form, values=[], width=25)
-        self.ctrl_combo.grid(row=0, column=3, padx=5)
-        self.ctrl_combo.bind("<<ComboboxSelected>>", lambda e: self._update_motor_combo())
-        ttk.Label(form, text="Motor").grid(row=0, column=4)
-        self.motor_combo = ttk.Combobox(form, values=[], width=10)
-        self.motor_combo.grid(row=0, column=5, padx=5)
+        form = QHBoxLayout()
+        form.addWidget(QLabel("OSC path"))
+        self.osc_entry = QLineEdit()
+        form.addWidget(self.osc_entry, 2)
+        form.addWidget(QLabel("Controller"))
+        self.ctrl_combo = QComboBox()
+        form.addWidget(self.ctrl_combo, 2)
+        form.addWidget(QLabel("Motor"))
+        self.motor_spin = QSpinBox()
+        self.motor_spin.setMinimum(0)
+        form.addWidget(self.motor_spin)
+        map_layout.addLayout(form)
 
-        bf = ttk.Frame(tab_map)
-        bf.pack(fill="x", padx=5, pady=5)
-        ttk.Button(bf, text="Add/Update", command=self._on_add_mapping).pack(side="left")
-        ttk.Button(bf, text="Delete", command=self._on_delete_mapping).pack(side="left", padx=5)
-        ttk.Button(bf, text="Save", command=self._on_save_mappings).pack(side="left", padx=5)
+        btn_row2 = QHBoxLayout()
+        add_btn = QPushButton("Add/Update")
+        add_btn.clicked.connect(self._on_add_mapping)
+        del_btn = QPushButton("Delete")
+        del_btn.clicked.connect(self._on_delete_mapping)
+        save_btn = QPushButton("Save")
+        save_btn.clicked.connect(self._on_save_mappings)
+        btn_row2.addWidget(add_btn)
+        btn_row2.addWidget(del_btn)
+        btn_row2.addWidget(save_btn)
+        btn_row2.addStretch()
+        map_layout.addLayout(btn_row2)
+        self.tabs.addTab(map_tab, "Mappings")
+
+        self.ctrl_combo.currentIndexChanged.connect(self._update_motor_range)
 
         # Settings tab
-        tab_set = ttk.Frame(nb)
-        nb.add(tab_set, text="Settings")
-        ttk.Label(tab_set, text="Listen IP").grid(row=0, column=0, padx=5, pady=5)
-        self.listen_ip = ttk.Entry(tab_set, width=20)
-        self.listen_ip.insert(0, self.cfg["listen"]["ip"])
-        self.listen_ip.grid(row=0, column=1)
-        ttk.Label(tab_set, text="Listen Port").grid(row=0, column=2, padx=5)
-        self.listen_port = ttk.Entry(tab_set, width=8)
-        self.listen_port.insert(0, str(self.cfg["listen"]["port"]))
-        self.listen_port.grid(row=0, column=3)
+        set_tab = QWidget()
+        set_layout = QFormLayout(set_tab)
+        self.listen_ip = QLineEdit(self.cfg["listen"]["ip"])
+        self.listen_port = QLineEdit(str(self.cfg["listen"]["port"]))
+        set_layout.addRow("Listen IP", self.listen_ip)
+        set_layout.addRow("Listen Port", self.listen_port)
+        self.tabs.addTab(set_tab, "Settings")
 
         # Log tab
-        tab_log = ttk.Frame(nb)
-        nb.add(tab_log, text="Log")
-        self.log_text = scrolledtext.ScrolledText(tab_log, height=15)
-        self.log_text.pack(fill="both", expand=True, padx=5, pady=5)
+        log_tab = QWidget()
+        log_layout = QVBoxLayout(log_tab)
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        log_layout.addWidget(self.log_text)
+        self.tabs.addTab(log_tab, "Log")
 
         # Bottom controls
-        bottom = ttk.Frame(self.root)
-        bottom.pack(fill="x", padx=5, pady=5)
-        ttk.Button(bottom, text="Start OSC Server", command=self._on_start).pack(side="left")
-        ttk.Button(bottom, text="Stop OSC Server", command=self._on_stop).pack(side="left", padx=5)
+        bottom = QHBoxLayout()
+        start_btn = QPushButton("Start OSC Server")
+        start_btn.clicked.connect(self._on_start)
+        stop_btn = QPushButton("Stop OSC Server")
+        stop_btn.clicked.connect(self._on_stop)
+        bottom.addWidget(start_btn)
+        bottom.addWidget(stop_btn)
+        bottom.addStretch()
+        root_layout.addLayout(bottom)
 
-    def _log(self, msg):
-        def _do():
-            self.log_text.insert("end", msg + "\n")
-            self.log_text.see("end")
-        try:
-            self.root.after(0, _do)
-        except Exception:
-            print(msg)
+    def _append_log(self, msg):
+        self.log_text.append(msg)
+        self.log_text.ensureCursorVisible()
 
     def _display_name_for(self, cid):
         for c in self.controllers:
@@ -461,42 +521,38 @@ class App:
         return name
 
     def _refresh_controller_list(self):
-        for w in self.ctrl_container.winfo_children():
-            w.destroy()
+        self.ctrl_list.clear()
         for c in self.controllers:
-            status = "connected" if c.is_connected() else "disconnected"
-            row = ttk.Frame(self.ctrl_container)
-            row.pack(fill="x", pady=2)
-            # color swatch / icon
-            if c.color:
-                sw = tk.Canvas(row, width=24, height=24, highlightthickness=1)
-                sw.pack(side="left", padx=4)
-                hexcolor = "#{:02x}{:02x}{:02x}".format(*c.color)
-                sw.create_rectangle(0, 0, 24, 24, fill=hexcolor, outline="#333")
-            elif c.icon:
-                ttk.Label(row, text=c.icon, font=("TkDefaultFont", 14)).pack(side="left", padx=4)
-            else:
-                ttk.Label(row, text="🎮", font=("TkDefaultFont", 14)).pack(side="left", padx=4)
-            ttk.Label(row, text=f"{c.display_name}  [{status}]  motors={c.motors}").pack(side="left", padx=4)
-        # update combo with display names
-        self.ctrl_combo["values"] = [c.display_name for c in self.controllers]
-        if self.controllers and not self.ctrl_combo.get():
-            self.ctrl_combo.set(self.controllers[0].display_name)
-        self._update_motor_combo()
+            item = QListWidgetItem()
+            row = ControllerRow(c)
+            item.setSizeHint(row.sizeHint())
+            self.ctrl_list.addItem(item)
+            self.ctrl_list.setItemWidget(item, row)
+        # combo
+        self.ctrl_combo.blockSignals(True)
+        self.ctrl_combo.clear()
+        for c in self.controllers:
+            self.ctrl_combo.addItem(c.display_name)
+        self.ctrl_combo.blockSignals(False)
+        if self.controllers:
+            self.ctrl_combo.setCurrentIndex(0)
+        self._update_motor_range()
 
-    def _update_motor_combo(self):
-        name = self.ctrl_combo.get()
+    def _update_motor_range(self):
+        name = self.ctrl_combo.currentText()
         ctrl = next((c for c in self.controllers if c.display_name == name), None)
         if ctrl:
-            self.motor_combo["values"] = list(range(len(ctrl.motors)))
-            if not self.motor_combo.get():
-                self.motor_combo.set("0")
+            self.motor_spin.setMaximum(max(0, len(ctrl.motors) - 1))
+            self.motor_spin.setValue(0)
 
     def _refresh_mapping_list(self):
-        for item in self.map_tree.get_children():
-            self.map_tree.delete(item)
+        self.map_table.setRowCount(0)
         for m in self.cfg.get("mappings", []):
-            self.map_tree.insert("", "end", values=(m["osc_path"], self._display_name_for(m["controller"]), m["motor"]))
+            row = self.map_table.rowCount()
+            self.map_table.insertRow(row)
+            self.map_table.setItem(row, 0, QTableWidgetItem(m["osc_path"]))
+            self.map_table.setItem(row, 1, QTableWidgetItem(self._display_name_for(m["controller"])))
+            self.map_table.setItem(row, 2, QTableWidgetItem(str(m["motor"])))
 
     def _on_refresh_controllers(self):
         self.controllers = discover_controllers()
@@ -504,7 +560,7 @@ class App:
             c.connect()
         self.bridge.update_controllers(self.controllers)
         self._refresh_controller_list()
-        self._log("Controllers refreshed")
+        self._append_log("Controllers refreshed")
 
     def _on_connect_all(self):
         for c in self.controllers:
@@ -512,61 +568,71 @@ class App:
         self._refresh_controller_list()
 
     def _on_add_mapping(self):
-        path = self.osc_entry.get().strip()
-        name = self.ctrl_combo.get().strip()
+        path = self.osc_entry.text().strip()
+        name = self.ctrl_combo.currentText().strip()
         cid = self._cid_for_display(name)
-        motor = self.motor_combo.get().strip()
+        motor = self.motor_spin.value()
         if not path or not cid:
-            messagebox.showwarning("Missing", "OSC path and controller required")
             return
-        try:
-            motor_i = int(motor)
-        except ValueError:
-            motor_i = 0
-        # replace existing
         mappings = [m for m in self.cfg["mappings"] if m["osc_path"] != path]
-        mappings.append({"osc_path": path, "controller": cid, "motor": motor_i})
+        mappings.append({"osc_path": path, "controller": cid, "motor": int(motor)})
         self.cfg["mappings"] = mappings
         self.bridge.update_config(self.cfg)
         self._refresh_mapping_list()
-        self._log(f"Mapping added: {path} -> {cid} motor {motor_i}")
+        self._append_log(f"Mapping added: {path} -> {cid} motor {motor}")
 
     def _on_delete_mapping(self):
-        sel = self.map_tree.selection()
-        if not sel:
-            return
-        vals = self.map_tree.item(sel[0], "values")
-        path = vals[0]
-        self.cfg["mappings"] = [m for m in self.cfg["mappings"] if m["osc_path"] != path]
+        rows = sorted(set(i.row() for i in self.map_table.selectedIndexes()), reverse=True)
+        for r in rows:
+            path_item = self.map_table.item(r, 0)
+            if not path_item:
+                continue
+            path = path_item.text()
+            self.cfg["mappings"] = [m for m in self.cfg["mappings"] if m["osc_path"] != path]
         self.bridge.update_config(self.cfg)
         self._refresh_mapping_list()
 
     def _on_save_mappings(self):
-        # update listen settings from entries
-        self.cfg["listen"]["ip"] = self.listen_ip.get().strip() or "0.0.0.0"
+        self.cfg["listen"]["ip"] = self.listen_ip.text().strip() or "0.0.0.0"
         try:
-            self.cfg["listen"]["port"] = int(self.listen_port.get().strip())
+            self.cfg["listen"]["port"] = int(self.listen_port.text().strip())
         except ValueError:
             pass
         save_config(self.cfg)
         self.bridge.update_config(self.cfg)
-        self._log("Config saved")
+        self._append_log("Config saved")
 
     def _on_start(self):
         self._on_save_mappings()
         self.bridge.start()
-        self._log("Starting OSC server")
+        self._append_log("Starting OSC server")
 
     def _on_stop(self):
         self.bridge.stop()
-        self._log("Stopping OSC server")
+        self._append_log("Stopping OSC server")
+
+    def _on_scheme_changed(self, scheme):
+        app = QApplication.instance()
+        app.setPalette(app.style().standardPalette())
+
+    def closeEvent(self, event):
+        try:
+            self.bridge.stop()
+        except Exception:
+            pass
+        event.accept()
 
 
 def main():
-    root = tk.Tk()
-    app = App(root)
-    root.geometry("720x520")
-    root.mainloop()
+    app = QApplication(sys.argv)
+    # native style; keep responsive to scheme changes
+    icon_path = find_image("app.ico" if sys.platform.startswith("win") else "app.png")
+    if icon_path.exists():
+        app.setWindowIcon(QIcon(str(icon_path)))
+    window = MainWindow()
+    window.resize(820, 560)
+    window.show()
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":
