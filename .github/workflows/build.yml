@@ -48,6 +48,23 @@ jobs:
       - name: Build
         run: python scripts/build.py
 
+      - name: Validate build (Linux)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          file dist/VRCJoyCon/VRCJoyCon
+          test -f dist/VRCJoyCon/images/app.png
+
+      - name: Validate build (macOS)
+        if: startsWith(matrix.os, 'macos')
+        run: |
+          file dist/VRCJoyCon.app/Contents/MacOS/VRCJoyCon
+          test -f dist/VRCJoyCon.app/Contents/Resources/images/app.png || true
+
+      - name: Validate build (Windows)
+        if: startsWith(matrix.os, 'windows')
+        run: |
+          file dist/VRCJoyCon/VRCJoyCon.exe
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
