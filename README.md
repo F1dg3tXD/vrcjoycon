@@ -203,7 +203,6 @@ GitHub Actions builds and uploads separate artifacts for:
 - Linux x64
 - Linux ARM64
 - macOS ARM64
-- macOS Intel x86_64
 
 ## Known limitations
 

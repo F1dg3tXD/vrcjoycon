@@ -16,10 +16,8 @@ jobs:
         include:
           - os: windows-latest
             label: Windows x64
-          - os: macos-14
+          - os: macos-15
             label: macOS ARM64
-          - os: macos-13
-            label: macOS x64
           - os: ubuntu-latest
             label: Linux x64
           - os: ubuntu-24.04-arm
@@ -52,7 +50,7 @@ jobs:
         if: startsWith(matrix.os, 'ubuntu')
         run: |
           file dist/VRCJoyCon/VRCJoyCon
-          test -f dist/VRCJoyCon/images/app.png
+          test -f dist/VRCJoyCon/_internal/images/app.png
 
       - name: Validate build (macOS)
         if: startsWith(matrix.os, 'macos')
@@ -63,7 +61,8 @@ jobs:
       - name: Validate build (Windows)
         if: startsWith(matrix.os, 'windows')
         run: |
-          file dist/VRCJoyCon/VRCJoyCon.exe
+          if (-not (Test-Path "dist/VRCJoyCon/VRCJoyCon.exe")) { exit 1 }
+          Write-Host "Windows executable found"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
