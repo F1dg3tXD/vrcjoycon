@@ -5,7 +5,7 @@ from .constants import JOYCON_L_PRODUCT_ID, JOYCON_R_PRODUCT_ID
 
 def get_device_ids(debug=False):
     """
-    returns a list of tuples like `(vendor_id, product_id, serial_number)`
+    returns a list of tuples like `(vendor_id, product_id, serial_number, path)`
     """
     devices = hid.enumerate(0, 0)
 
@@ -15,6 +15,7 @@ def get_device_ids(debug=False):
         product_id     = device["product_id"]
         product_string = device["product_string"]
         serial = device.get('serial') or device.get("serial_number")
+        path = device.get("path")
 
         if vendor_id != JOYCON_VENDOR_ID:
             continue
@@ -23,13 +24,14 @@ def get_device_ids(debug=False):
         if not product_string:
             continue
 
-        out.append((vendor_id, product_id, serial))
+        out.append((vendor_id, product_id, serial, path))
 
         if debug:
             print(product_string)
             print(f"\tvendor_id  is {vendor_id!r}")
             print(f"\tproduct_id is {product_id!r}")
             print(f"\tserial     is {serial!r}")
+            print(f"\tpath       is {path!r}")
 
     return out
 

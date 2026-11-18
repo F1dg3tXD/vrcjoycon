@@ -10,6 +10,7 @@ import asyncio
 import configparser
 import json
 import logging
+import math
 import os
 import sys
 import threading
@@ -71,6 +72,27 @@ def find_image(name):
     return candidates[-1]
 
 
+JOYCON_COLOR_NAMES = {
+    (237, 28, 36): "RED",
+    (0, 120, 215): "BLUE",
+    (255, 204, 0): "YELLOW",
+    (57, 255, 20): "GREEN",
+    (128, 128, 128): "GRAY",
+    (255, 255, 255): "WHITE",
+    (0, 0, 0): "BLACK",
+    (255, 105, 180): "PINK",
+    (128, 0, 128): "PURPLE",
+    (255, 140, 0): "ORANGE",
+}
+
+
+def color_name(rgb):
+    if not rgb:
+        return "UNKNOWN"
+    best = min(JOYCON_COLOR_NAMES, key=lambda c: sum((c[i] - rgb[i]) ** 2 for i in range(3)))
+    return JOYCON_COLOR_NAMES[best]
+
+
 def clamp_strength(value):
     try:
         v = float(value)
@@ -91,9 +113,12 @@ class Controller:
         self.display_name = name
         self.color = None
         self.icon = None
+        self.pair_colors = None
         self.motors = list(motors)
         self.backend = backend
-        self.output_states = [0.0 for _ in self.motors]
+        self.base_states = [0.0 for _ in self.motors]
+        self.pulse_states = [0.0 for _ in self.motors]
+        self.output_states = self.base_states
         self._lock = threading.Lock()
 
     def connect(self):
@@ -103,24 +128,44 @@ class Controller:
         pass
 
     def set_output(self, index, strength):
+        return self.set_base_output(index, strength)
+
+    def set_base_output(self, index, strength):
         strength = clamp_strength(strength)
         with self._lock:
             if index < 0 or index >= len(self.motors):
                 return False
-            self.output_states[index] = strength
+            self.base_states[index] = strength
         try:
             self._apply()
         except Exception as e:
             log.error("Controller apply error %s: %s", self.cid, e)
         return True
 
+    def add_pulse(self, index, amount):
+        amount = clamp_strength(amount)
+        with self._lock:
+            if index < 0 or index >= len(self.motors):
+                return False
+            self.pulse_states[index] = min(2.0, self.pulse_states[index] + amount)
+        try:
+            self._apply()
+        except Exception as e:
+            log.error("Controller pulse error %s: %s", self.cid, e)
+        return True
+
     def get_output(self, index):
         with self._lock:
             if index < 0 or index >= len(self.motors):
                 return 0.0
-            return self.output_states[index]
+            return self.base_states[index]
 
     def tick(self):
+        with self._lock:
+            for i in range(len(self.pulse_states)):
+                self.pulse_states[i] *= 0.82
+                if self.pulse_states[i] < 0.01:
+                    self.pulse_states[i] = 0.0
         try:
             self._apply()
         except Exception as e:
@@ -128,7 +173,8 @@ class Controller:
 
     def stop_all(self):
         with self._lock:
-            self.output_states = [0.0 for _ in self.motors]
+            self.base_states = [0.0 for _ in self.motors]
+            self.pulse_states = [0.0 for _ in self.motors]
         try:
             self._apply()
         except Exception as e:
@@ -144,7 +190,8 @@ class Controller:
 class JoyConController(Controller):
     def __init__(self, serial, product_id, path=""):
         side = "L" if product_id == 0x2006 else "R"
-        super().__init__(f"joycon:{product_id:04x}:{serial or path}", "joycon",
+        stable = serial or path or "unknown"
+        super().__init__(f"joycon:{product_id:04x}:{stable}", "joycon",
                          f"Joy-Con ({side})", ["Rumble"], backend="hid")
         self.serial = serial
         self.product_id = product_id
@@ -157,13 +204,14 @@ class JoyConController(Controller):
         try:
             ids = None
             if get_device_ids:
-                for vid, pid, serial in get_device_ids():
-                    if serial == self.serial:
-                        ids = (vid, pid, serial)
+                for vid, pid, serial, path in get_device_ids():
+                    if (self.serial and serial == self.serial) or (not self.serial and path and path == self.path):
+                        ids = (vid, pid, serial, path)
                         break
             if not ids:
                 return False
-            self._jc = _JoyConBase(*ids)
+            vid, pid, serial, path = ids
+            self._jc = _JoyConBase(vid, pid, serial, path=path)
             try:
                 body = self._jc.color_body
                 if body:
@@ -181,14 +229,43 @@ class JoyConController(Controller):
             log.error("JoyCon connect failed: %s", e)
             return False
 
+    def _encode_joycon_rumble(self, amplitude):
+        amplitude = max(0.0, min(1.0, amplitude))
+        if amplitude <= 0.0:
+            return b"\\x00\\x01\\x40\\x40"
+        if amplitude > 0.23:
+            encoded = round(math.log2(amplitude * 8.7) * 32.0)
+        elif amplitude > 0.12:
+            encoded = round(math.log2(amplitude * 17.0) * 16.0)
+        else:
+            encoded = round(amplitude * 64.0)
+        encoded = int(max(0, min(255, encoded)))
+        hf = 0x0100
+        hf_amp = encoded * 2
+        lf = 0x40
+        lf_amp = encoded // 2 + 64
+        byte0 = hf & 0xFF
+        byte1 = (hf_amp + ((hf >> 8) & 0xFF)) & 0xFF
+        byte2 = (lf + ((lf_amp >> 8) & 0xFF)) & 0xFF
+        byte3 = lf_amp & 0xFF
+        return bytes([byte0, byte1, byte2, byte3])
+
     def _apply(self):
         if not self._jc:
             return
-        active = any(s > 0.0 for s in self.output_states)
-        if active:
-            self._jc.rumble_simple()
+        with self._lock:
+            effective = [min(1.0, max(0.0, self.base_states[i] + self.pulse_states[i])) for i in range(len(self.motors))]
+        amplitude = max(effective) if effective else 0.0
+        neutral = b"\\x00\\x01\\x40\\x40"
+        side = self._encode_joycon_rumble(amplitude)
+        if self.product_id == 0x2006:
+            data = side + neutral
         else:
-            self._jc.rumble_stop()
+            data = neutral + side
+        try:
+            self._jc._send_rumble(data)
+        except Exception as e:
+            log.error("JoyCon rumble error: %s", e)
 
     def rumble(self, motor_index, strength):
         self.set_output(motor_index, strength)
@@ -201,12 +278,20 @@ class JoyConController(Controller):
 
 
 class GamepadController(Controller):
-    def __init__(self, index, guid=""):
-        cid = f"gamepad:{guid}" if guid else f"gamepad:index:{index}"
+    def __init__(self, index, guid="", instance_id=None, pair_colors=None, display_name_override=None):
+        if instance_id is not None:
+            cid = f"gamepad:instance:{instance_id}"
+        elif guid:
+            cid = f"gamepad:{guid}"
+        else:
+            cid = f"gamepad:index:{index}"
         super().__init__(cid, "gamepad", f"Gamepad #{index}", ["Low-frequency", "High-frequency"],
                          backend="sdl")
         self.index = index
         self.guid = guid
+        self.instance_id = instance_id
+        self.pair_colors = pair_colors
+        self.display_name_override = display_name_override
         self._js = None
 
     def connect(self):
@@ -219,7 +304,12 @@ class GamepadController(Controller):
             for i in range(pygame.joystick.get_count()):
                 candidate = pygame.joystick.Joystick(i)
                 candidate.init()
-                if self.guid and candidate.get_guid() == self.guid:
+                iid = getattr(candidate, "get_instance_id", lambda: None)()
+                if self.instance_id is not None and iid == self.instance_id:
+                    js = candidate
+                    self.index = i
+                    break
+                if self.instance_id is None and self.guid and candidate.get_guid() == self.guid:
                     js = candidate
                     self.index = i
                     break
@@ -231,10 +321,20 @@ class GamepadController(Controller):
             self._js = js
             name = self._js.get_name() or f"Gamepad #{self.index}"
             self.name = name
+            if self.instance_id is None:
+                self.instance_id = getattr(self._js, "get_instance_id", lambda: None)()
+                if self.instance_id is not None:
+                    self.cid = f"gamepad:instance:{self.instance_id}"
             if not self.guid:
                 self.guid = self._js.get_guid()
-                self.cid = f"gamepad:{self.guid}" if self.guid else self.cid
-            self.display_name = f"🎮 {name}"
+                if not self.instance_id:
+                    self.cid = f"gamepad:{self.guid}" if self.guid else self.cid
+            if self.display_name_override:
+                self.display_name = self.display_name_override
+                self.name = self.display_name
+            else:
+                self.display_name = f"🎮 {name}"
+                self.name = self.display_name
             self.icon = "🎮"
             return True
         except Exception as e:
@@ -244,10 +344,11 @@ class GamepadController(Controller):
     def _apply(self):
         if not self._js:
             return
-        states = list(self.output_states)
-        low = states[0] if len(states) > 0 else 0.0
-        high = states[1] if len(states) > 1 else 0.0
-        if any(s > 0.0 for s in states):
+        with self._lock:
+            effective = [min(1.0, max(0.0, self.base_states[i] + self.pulse_states[i])) for i in range(len(self.motors))]
+        low = effective[0] if len(effective) > 0 else 0.0
+        high = effective[1] if len(effective) > 1 else 0.0
+        if any(s > 0.0 for s in effective):
             self._js.rumble(low, high, 250)
         else:
             self._js.rumble(0, 0, 0)
@@ -266,39 +367,102 @@ def discover_controllers(existing=None):
     existing_by_cid = {c.cid: c for c in (existing or [])}
     controllers = []
 
-    # Joy-Cons via HID
-    if get_device_ids is not None:
-        try:
-            for vid, pid, serial in get_device_ids():
-                cid = f"joycon:{pid:04x}:{serial}"
-                if cid in existing_by_cid and existing_by_cid[cid].is_connected():
-                    controllers.append(existing_by_cid[cid])
-                    continue
-                c = JoyConController(serial, pid)
-                c.connect()
-                controllers.append(c)
-        except Exception as e:
-            log.error("JoyCon discovery error: %s", e)
-
-    # Gamepads via SDL/pygame
+    sdl_gamepads = []
+    paired_joycon_present = False
     if pygame is not None:
         try:
             pygame.joystick.init()
             for i in range(pygame.joystick.get_count()):
                 js = pygame.joystick.Joystick(i)
                 js.init()
+                name = (js.get_name() or "").lower()
                 guid = js.get_guid()
-                cid = f"gamepad:{guid}" if guid else f"gamepad:index:{i}"
+                iid = getattr(js, "get_instance_id", lambda: None)()
+                sdl_gamepads.append((i, guid, name, js, iid))
+                if "joy-con" in name or "joycon" in name:
+                    if js.get_numbuttons() >= 10 or "pair" in name or "combined" in name:
+                        paired_joycon_present = True
+        except Exception as e:
+            log.error("Gamepad discovery error: %s", e)
+
+    hid_pair_colors = []
+    if get_device_ids is not None:
+        try:
+            for vid, pid, serial, path in get_device_ids():
+                c = JoyConController(serial, pid, path)
+                if c.connect() and c.color is not None:
+                    hid_pair_colors.append((pid, c.color))
+        except Exception as e:
+            log.error("JoyCon color discovery error: %s", e)
+    left_pair_colors = [col for pid, col in hid_pair_colors if pid == 0x2006]
+    right_pair_colors = [col for pid, col in hid_pair_colors if pid == 0x2007]
+
+    if paired_joycon_present:
+        left_idx = 0
+        right_idx = 0
+        if pygame is not None:
+            try:
+                for i, guid, name, js, iid in sdl_gamepads:
+                    if not ("joy-con" in name or "joycon" in name):
+                        continue
+                    if not (js.get_numbuttons() >= 10 or "pair" in name or "combined" in name):
+                        continue
+                    lc = left_pair_colors[left_idx] if left_idx < len(left_pair_colors) else None
+                    rc = right_pair_colors[right_idx] if right_idx < len(right_pair_colors) else None
+                    left_idx += 1
+                    right_idx += 1
+                    lc_name = color_name(lc)
+                    rc_name = color_name(rc)
+                    display_override = f"PAIR:{lc_name}|{rc_name}"
+                    pair_colors = [lc if lc else (128, 128, 128), rc if rc else (128, 128, 128)]
+                    if iid is not None:
+                        cid = f"gamepad:instance:{iid}"
+                    elif guid:
+                        cid = f"gamepad:{guid}"
+                    else:
+                        cid = f"gamepad:index:{i}"
+                    if cid in existing_by_cid and existing_by_cid[cid].is_connected():
+                        controllers.append(existing_by_cid[cid])
+                        continue
+                    c = GamepadController(i, guid, iid, pair_colors=pair_colors, display_name_override=display_override)
+                    c.connect()
+                    controllers.append(c)
+            except Exception as e:
+                log.error("Gamepad discovery error: %s", e)
+    else:
+        if get_device_ids is not None:
+            try:
+                for vid, pid, serial, path in get_device_ids():
+                    cid = f"joycon:{pid:04x}:{serial or path}"
+                    if cid in existing_by_cid and existing_by_cid[cid].is_connected():
+                        controllers.append(existing_by_cid[cid])
+                        continue
+                    c = JoyConController(serial, pid, path)
+                    c.connect()
+                    controllers.append(c)
+            except Exception as e:
+                log.error("JoyCon discovery error: %s", e)
+
+    if pygame is not None:
+        try:
+            for i, guid, name, js, iid in sdl_gamepads:
+                if "joy-con" in name or "joycon" in name:
+                    continue
+                if iid is not None:
+                    cid = f"gamepad:instance:{iid}"
+                elif guid:
+                    cid = f"gamepad:{guid}"
+                else:
+                    cid = f"gamepad:index:{i}"
                 if cid in existing_by_cid and existing_by_cid[cid].is_connected():
                     controllers.append(existing_by_cid[cid])
                     continue
-                c = GamepadController(i, guid)
+                c = GamepadController(i, guid, iid)
                 c.connect()
                 controllers.append(c)
         except Exception as e:
             log.error("Gamepad discovery error: %s", e)
 
-    # unique display names
     seen = {}
     for c in controllers:
         base = c.display_name
@@ -309,7 +473,6 @@ def discover_controllers(existing=None):
         else:
             seen[base] = 1
     return controllers
-
 
 # ---------------- Config ----------------
 
@@ -332,7 +495,7 @@ def _validate_mapping(mapping):
 
 
 def _default_config():
-    return {"version": CONFIG_VERSION, "listen": {"ip": "0.0.0.0", "port": 9001}, "mappings": []}
+    return {"version": CONFIG_VERSION, "listen": {"ip": "0.0.0.0", "port": 9001}, "mappings": [], "controllers": {}}
 
 
 def _migrate_ini_config():
@@ -401,6 +564,8 @@ def load_config():
                 if vm:
                     validated.append(vm)
             data["mappings"] = validated
+            if not isinstance(data.get("controllers"), dict):
+                data["controllers"] = {}
             if "version" not in data:
                 data["version"] = CONFIG_VERSION
             return data
@@ -435,6 +600,8 @@ def save_config(cfg):
         cfg["listen"]["port"] = 9001
     if not isinstance(cfg.get("mappings"), list):
         cfg["mappings"] = []
+    if not isinstance(cfg.get("controllers"), dict):
+        cfg["controllers"] = {}
     validated = []
     for m in cfg["mappings"]:
         vm = _validate_mapping(m)
@@ -471,6 +638,7 @@ class OscBridge:
         self.transport = None
         self.mappings = {}
         self.monitor = {}  # path -> dict
+        self._previous_values = {}
         self._lock = threading.Lock()
         self._rebuild_mappings()
 
@@ -524,7 +692,14 @@ class OscBridge:
             self._log(f"No controller {cid} for {path}")
             return
         try:
-            ctrl.set_output(int(motor), value)
+            prev = self._previous_values.get(path, 0.0)
+            delta = value - prev
+            self._previous_values[path] = value
+            setter = getattr(ctrl, "set_base_output", None) or ctrl.set_output
+            setter(int(motor), value)
+            if delta > 0.05 and hasattr(ctrl, "add_pulse"):
+                pulse = min(1.0, delta * 2.0 + value * 0.5)
+                ctrl.add_pulse(int(motor), pulse)
             self._log(f"{path} -> {cid} output {motor}: {value}{' (simulated)' if simulated else ''}")
         except Exception as e:
             self._log(f"Rumble dispatch error: {e}")
@@ -607,7 +782,14 @@ class ControllerRow(QWidget):
         super().__init__()
         layout = QHBoxLayout(self)
         layout.setContentsMargins(4, 2, 4, 2)
-        if controller.color:
+        if controller.pair_colors:
+            for col in controller.pair_colors:
+                sw = QFrame()
+                sw.setFixedSize(20, 20)
+                r, g, b = col
+                sw.setStyleSheet(f"background-color: rgb({r},{g},{b}); border: 1px solid #555; border-radius: 3px;")
+                layout.addWidget(sw)
+        elif controller.color:
             sw = QFrame()
             sw.setFixedSize(24, 24)
             r, g, b = controller.color
@@ -636,6 +818,7 @@ class MainWindow(QMainWindow):
 
         self.cfg = load_config()
         self.controllers = discover_controllers()
+        self._apply_saved_appearance()
         self.emitter = LogEmitter()
         self.monitor_emitter = MonitorEmitter()
         self.bridge = OscBridge(self.cfg, self.controllers, self.emitter, self.monitor_emitter)
@@ -659,10 +842,34 @@ class MainWindow(QMainWindow):
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
-        root_layout = QVBoxLayout(central)
+        root_layout = QHBoxLayout(central)
 
         self.tabs = QTabWidget()
-        root_layout.addWidget(self.tabs, 1)
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.addWidget(self.tabs, 1)
+
+        # bottom controls attached to left column
+        bottom = QHBoxLayout()
+        start_btn = QPushButton("Start OSC Server")
+        start_btn.clicked.connect(self._on_start)
+        stop_btn = QPushButton("Stop OSC Server")
+        stop_btn.clicked.connect(self._on_stop)
+        bottom.addWidget(start_btn)
+        bottom.addWidget(stop_btn)
+        bottom.addStretch()
+        left_layout.addLayout(bottom)
+
+        root_layout.addWidget(left_widget, 3)
+
+        # persistent console panel on the right
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.addWidget(QLabel("Console"))
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        right_layout.addWidget(self.log_text, 1)
+        root_layout.addWidget(right_widget, 1)
 
         # Controllers tab
         ctrl_tab = QWidget()
@@ -702,6 +909,21 @@ class MainWindow(QMainWindow):
         form.addWidget(self.motor_spin)
         map_layout.addLayout(form)
 
+        preset_box = QHBoxLayout()
+        preset_box.addWidget(QLabel("Parameter name"))
+        self.param_entry = QLineEdit()
+        preset_box.addWidget(self.param_entry, 2)
+        self.preset_combo = QComboBox()
+        self.preset_combo.addItems(["joyconrumble1", "joyconrumble2"])
+        preset_box.addWidget(self.preset_combo)
+        fill_btn = QPushButton("Use /avatar/parameters/")
+        fill_btn.clicked.connect(self._fill_preset)
+        preset_box.addWidget(fill_btn)
+        use_selected_btn = QPushButton("Use selected")
+        use_selected_btn.clicked.connect(self._use_selected_preset)
+        preset_box.addWidget(use_selected_btn)
+        map_layout.addLayout(preset_box)
+
         btn_row2 = QHBoxLayout()
         add_btn = QPushButton("Add/Update")
         add_btn.clicked.connect(self._on_add_mapping)
@@ -730,24 +952,7 @@ class MainWindow(QMainWindow):
         set_layout.addRow("Listen Port", self.listen_port)
         self.tabs.addTab(set_tab, "Settings")
 
-        # Log tab
-        log_tab = QWidget()
-        log_layout = QVBoxLayout(log_tab)
-        self.log_text = QTextEdit()
-        self.log_text.setReadOnly(True)
-        log_layout.addWidget(self.log_text)
-        self.tabs.addTab(log_tab, "Log")
-
-        # Bottom controls
-        bottom = QHBoxLayout()
-        start_btn = QPushButton("Start OSC Server")
-        start_btn.clicked.connect(self._on_start)
-        stop_btn = QPushButton("Stop OSC Server")
-        stop_btn.clicked.connect(self._on_stop)
-        bottom.addWidget(start_btn)
-        bottom.addWidget(stop_btn)
-        bottom.addStretch()
-        root_layout.addLayout(bottom)
+        # Bottom controls already added to left column
 
     def _build_haptics_tab(self):
         tab = QWidget()
@@ -769,6 +974,17 @@ class MainWindow(QMainWindow):
         self.monitor_table.setHorizontalHeaderLabels(["Parameter", "Controller", "Output", "Value", "Active", "Source", "Last Update"])
         self.monitor_table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.monitor_table, 2)
+
+        # Controller appearance / color assignment
+        layout.addWidget(QLabel("Controller appearance"))
+        app_scroll = QScrollArea()
+        app_scroll.setWidgetResizable(True)
+        self.appearance_container = QWidget()
+        self.appearance_layout = QVBoxLayout(self.appearance_container)
+        self.appearance_layout.addStretch()
+        app_scroll.setWidget(self.appearance_container)
+        layout.addWidget(app_scroll, 1)
+        self._refresh_appearance()
 
         # Manual simulation
         sim_box = QHBoxLayout()
@@ -805,6 +1021,25 @@ class MainWindow(QMainWindow):
             if c.cid == cid:
                 return c.display_name
         return cid
+
+    def _apply_saved_appearance(self):
+        saved = self.cfg.get("controllers", {})
+        for c in self.controllers:
+            info = saved.get(c.cid)
+            if not isinstance(info, dict):
+                continue
+            if isinstance(info.get("display_name"), str):
+                c.display_name = info["display_name"]
+                c.name = c.display_name
+            if isinstance(info.get("color"), list) and len(info["color"]) == 3:
+                c.color = tuple(int(x) for x in info["color"])
+            if isinstance(info.get("pair_colors"), list):
+                parsed = []
+                for col in info["pair_colors"]:
+                    if isinstance(col, list) and len(col) == 3:
+                        parsed.append(tuple(int(x) for x in col))
+                if parsed:
+                    c.pair_colors = parsed
 
     def _refresh_controller_list(self):
         self.ctrl_list.clear()
@@ -854,6 +1089,13 @@ class MainWindow(QMainWindow):
             for i, label in enumerate(c.motors):
                 row = QFrame()
                 rl = QHBoxLayout(row)
+                if c.pair_colors:
+                    for col in c.pair_colors:
+                        sw = QFrame()
+                        sw.setFixedSize(16, 16)
+                        r, g, b = col
+                        sw.setStyleSheet(f"background-color: rgb({r},{g},{b}); border: 1px solid #555; border-radius: 2px;")
+                        rl.addWidget(sw)
                 rl.addWidget(QLabel(f"{c.display_name}"))
                 rl.addWidget(QLabel(f"({c.cid})"))
                 rl.addWidget(QLabel(f"Output {i}: {label}"))
@@ -887,6 +1129,74 @@ class MainWindow(QMainWindow):
                 self.haptics_layout.addWidget(row)
         self.haptics_layout.addStretch()
         self._refresh_sim_combo()
+
+    def _parse_color(self, text):
+        text = text.strip()
+        if text in JOYCON_COLOR_NAMES.values():
+            # reverse lookup
+            for rgb, name in JOYCON_COLOR_NAMES.items():
+                if name == text.upper():
+                    return rgb
+        if text.startswith("#") and len(text) == 7:
+            try:
+                return (int(text[1:3], 16), int(text[3:5], 16), int(text[5:7], 16))
+            except ValueError:
+                return None
+        return None
+
+    def _refresh_appearance(self):
+        while self.appearance_layout.count():
+            item = self.appearance_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        for c in self.controllers:
+            row = QFrame()
+            rl = QHBoxLayout(row)
+            rl.addWidget(QLabel(c.cid))
+            name_edit = QLineEdit(c.display_name)
+            rl.addWidget(name_edit, 2)
+            if c.pair_colors:
+                left_edit = QLineEdit("#%02x%02x%02x" % c.pair_colors[0])
+                right_edit = QLineEdit("#%02x%02x%02x" % c.pair_colors[1])
+                rl.addWidget(QLabel("L"))
+                rl.addWidget(left_edit)
+                rl.addWidget(QLabel("R"))
+                rl.addWidget(right_edit)
+            else:
+                color_edit = QLineEdit("#%02x%02x%02x" % c.color if c.color else "#808080")
+                rl.addWidget(color_edit)
+            apply_btn = QPushButton("Apply")
+            def make_apply(ctrl=c, ne=name_edit, le=locals().get("left_edit"), re=locals().get("right_edit"), ce=locals().get("color_edit")):
+                def _apply():
+                    ctrl.display_name = ne.text().strip() or ctrl.display_name
+                    ctrl.name = ctrl.display_name
+                    if ctrl.pair_colors is not None:
+                        lc = self._parse_color(le.text()) if le else None
+                        rc = self._parse_color(re.text()) if re else None
+                        if lc:
+                            ctrl.pair_colors[0] = lc
+                        if rc:
+                            ctrl.pair_colors[1] = rc
+                    else:
+                        col = self._parse_color(ce.text()) if ce else None
+                        if col:
+                            ctrl.color = col
+                    self.cfg.setdefault("controllers", {})
+                    self.cfg["controllers"][ctrl.cid] = {
+                        "display_name": ctrl.display_name,
+                        "color": list(ctrl.color) if ctrl.color else None,
+                        "pair_colors": [list(x) for x in ctrl.pair_colors] if ctrl.pair_colors else None,
+                    }
+                    save_config(self.cfg)
+                    self._refresh_controller_list()
+                    self._refresh_haptics()
+                    self._refresh_appearance()
+                    self._append_log(f"Updated appearance for {ctrl.cid}")
+                return _apply
+            apply_btn.clicked.connect(make_apply())
+            rl.addWidget(apply_btn)
+            self.appearance_layout.addWidget(row)
+        self.appearance_layout.addStretch()
 
     def _stop_output(self, ctrl, idx, status_label):
         ctrl.set_output(idx, 0.0)
@@ -926,9 +1236,11 @@ class MainWindow(QMainWindow):
         self.controllers = discover_controllers(self.controllers)
         for c in self.controllers:
             c.connect()
+        self._apply_saved_appearance()
         self.bridge.update_controllers(self.controllers)
         self._refresh_controller_list()
         self._refresh_haptics()
+        self._refresh_appearance()
         self._append_log("Controllers refreshed")
 
     def _on_connect_all(self):
@@ -936,6 +1248,16 @@ class MainWindow(QMainWindow):
             c.connect()
         self._refresh_controller_list()
         self._refresh_haptics()
+
+    def _fill_preset(self):
+        name = self.param_entry.text().strip()
+        if name:
+            self.osc_entry.setText(f"/avatar/parameters/{name}")
+
+    def _use_selected_preset(self):
+        name = self.preset_combo.currentText().strip()
+        if name:
+            self.osc_entry.setText(f"/avatar/parameters/{name}")
 
     def _on_add_mapping(self):
         path = self.osc_entry.text().strip()

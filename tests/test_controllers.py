@@ -7,11 +7,8 @@ class FakeJoyCon:
     def __init__(self):
         self.calls = []
 
-    def rumble_simple(self):
-        self.calls.append("simple")
-
-    def rumble_stop(self):
-        self.calls.append("stop")
+    def _send_rumble(self, data):
+        self.calls.append(("rumble", data))
 
     def connected(self):
         return True
@@ -23,9 +20,9 @@ def test_joycon_output_independent_and_state():
     c._jc = fake
     assert c.set_output(0, 1.0) is True
     assert c.get_output(0) == 1.0
-    assert "simple" in fake.calls
+    assert any(call[0] == "rumble" for call in fake.calls)
     assert c.set_output(0, 0.0) is True
-    assert "stop" in fake.calls
+    assert any(call[0] == "rumble" for call in fake.calls)
     # invalid index does not crash and returns False
     assert c.set_output(5, 1.0) is False
 

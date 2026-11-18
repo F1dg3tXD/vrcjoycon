@@ -20,7 +20,7 @@ class JoyCon:
     color_body : (int, int, int)
     color_btn  : (int, int, int)
 
-    def __init__(self, vendor_id: int, product_id: int, serial: str = None, simple_mode=False):
+    def __init__(self, vendor_id: int, product_id: int, serial: str = None, simple_mode=False, path=None):
         if vendor_id != JOYCON_VENDOR_ID:
             raise ValueError(f'vendor_id is invalid: {vendor_id!r}')
 
@@ -30,6 +30,7 @@ class JoyCon:
         self.vendor_id   = vendor_id
         self.product_id  = product_id
         self.serial      = serial
+        self.path        = path
         self.simple_mode = simple_mode  # TODO: It's for reporting mode 0x3f
         
         # setup internal state
@@ -54,13 +55,20 @@ class JoyCon:
         try:
             if hasattr(hid, "device"):  # hidapi
                 _joycon_device = hid.device()
-                _joycon_device.open(vendor_id, product_id, serial)
+                if serial:
+                    _joycon_device.open(vendor_id, product_id, serial)
+                elif path:
+                    _joycon_device.open_path(path)
+                else:
+                    _joycon_device.open(vendor_id, product_id)
             elif hasattr(hid, "Device"):  # hid
-                _joycon_device = hid.Device(vendor_id, product_id, serial)
-                
+                if path:
+                    _joycon_device = hid.Device(path=path)
+                else:
+                    _joycon_device = hid.Device(vendor_id, product_id, serial)
             else:
                 raise Exception("Implementation of hid is not recognized!")
-        except IOError as e:
+        except Exception as e:
             raise IOError('joycon connect failed') from e
         return _joycon_device
 
